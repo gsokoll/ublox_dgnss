@@ -18,6 +18,7 @@
 #include <sstream>
 #include <vector>
 #include "ublox_dgnss_node/ubx/ubx_types.hpp"
+#include "ublox_dgnss_node/ubx/ubx_exceptions.hpp"
 
 namespace ubx
 {
@@ -192,6 +193,12 @@ inline T swap_endian(T & value)
 template<typename T>
 inline T buf_offset(std::vector<u1_t> * buf, u2_t offset)
 {
+  // FIX Issue 8: Bounds check before memcpy to prevent OOB read
+  if (static_cast<size_t>(offset) + sizeof(T) > buf->size()) {
+    throw UbxPayloadException(
+      "buf_offset: OOB access at offset " + std::to_string(offset) +
+      " + " + std::to_string(sizeof(T)) + " > buf size " + std::to_string(buf->size()));
+  }
   T value;
   memcpy(&value, buf->data() + offset, sizeof(T));
   return value;
