@@ -15,6 +15,15 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Address Sanitizer option for detecting memory errors (Issue 3 diagnostic)
+# Build with: colcon build --cmake-args -DENABLE_ADDRESS_SANITIZER=ON
+option(ENABLE_ADDRESS_SANITIZER "Enable Address Sanitizer for memory error detection" OFF)
+if(ENABLE_ADDRESS_SANITIZER)
+  message(STATUS "Address Sanitizer ENABLED - expect ~2x slowdown")
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g -O1)
+  add_link_options(-fsanitize=address)
+endif()
+
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 # find dependencies
