@@ -716,16 +716,18 @@ std::shared_ptr<transfer_t> Connection::make_transfer_out(u_char * buf, size_t s
   std::memcpy(transfer->buffer->data(), buf, size);
   transfer->completed = false;
 
-  // void * user_data = &transfer->completed;
-  transfer->usb_transfer->user_data = new std::shared_ptr<transfer_t>(transfer);
+  // FIX Issue 10: Use unique_ptr for exception safety, release only after setup complete
+  auto user_data_ptr = std::make_unique<std::shared_ptr<transfer_t>>(transfer);
   transfer->usb_transfer->flags = LIBUSB_TRANSFER_SHORT_NOT_OK;
 
   libusb_fill_bulk_transfer(
     transfer->usb_transfer, devh_, ep_data_out_addr_ | LIBUSB_ENDPOINT_OUT,
-    // buf, size,
     transfer->buffer->data(), transfer->buffer->size(),
-    callback_out_fn_, transfer->usb_transfer->user_data, 0
+    callback_out_fn_, user_data_ptr.get(), 0
   );
+
+  // Transfer ownership to libusb - caller responsible for cleanup via callback
+  transfer->usb_transfer->user_data = user_data_ptr.release();
 
   return transfer;
 }
@@ -737,15 +739,17 @@ std::shared_ptr<transfer_t> Connection::make_transfer_in()
   transfer->buffer->resize(IN_BUFFER_SIZE);
   transfer->completed = false;
 
-  // void * user_data = &transfer->completed;
-  transfer->usb_transfer->user_data = new std::shared_ptr<transfer_t>(transfer);
+  // FIX Issue 10: Use unique_ptr for exception safety, release only after setup complete
+  auto user_data_ptr = std::make_unique<std::shared_ptr<transfer_t>>(transfer);
 
   // setup asynchronous transfer in to host from usb
   libusb_fill_bulk_transfer(
     transfer->usb_transfer, devh_, ep_data_in_addr_ | LIBUSB_ENDPOINT_IN,
-    // in_buffer_, IN_BUFFER_SIZE,
     transfer->buffer->data(), transfer->buffer->size(),
-    callback_in_fn_, transfer->usb_transfer->user_data, 0);
+    callback_in_fn_, user_data_ptr.get(), 0);
+
+  // Transfer ownership to libusb - caller responsible for cleanup via callback
+  transfer->usb_transfer->user_data = user_data_ptr.release();
 
   return transfer;
 }
