@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <atomic>
 #include <iostream>
 #include <exception>
 #include <string>
@@ -141,8 +142,9 @@ private:
   connection_exception_cb_fn exception_cb_fn_;
   connection_debug_cb_fn debug_cb_fn_;
   struct timeval timeout_tv_;
-  bool keep_running_;
-  bool attached_;
+  // FIX Issue 9: Use atomic for cross-thread flags to avoid data race
+  std::atomic<bool> keep_running_;
+  std::atomic<bool> attached_;
 
   USBDriverState driver_state_;
 
