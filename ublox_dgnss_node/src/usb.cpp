@@ -582,7 +582,7 @@ void Connection::callback_out(struct libusb_transfer * transfer)
     switch (transfer->status) {
       case LIBUSB_TRANSFER_ERROR:
         msg = "Transfer failed";
-        return;
+        // FIX Issue 5: Removed early return that skipped cleanup (memory leak)
         break;
       case LIBUSB_TRANSFER_TIMED_OUT:
         msg = "Transfer timed out";
@@ -595,7 +595,7 @@ void Connection::callback_out(struct libusb_transfer * transfer)
         break;
       case LIBUSB_TRANSFER_NO_DEVICE:
         msg = "Transfer device disconnected";
-        return;
+        // FIX Issue 5: Removed early return that skipped cleanup (memory leak)
         break;
       case LIBUSB_TRANSFER_OVERFLOW:
         msg = "Transfer overflow. Device sent more data than requested";
@@ -652,10 +652,9 @@ void Connection::callback_in(struct libusb_transfer * transfer)
       case LIBUSB_TRANSFER_STALL:
         msg = "Transfer stalled";
         break;
-      case LIBUSB_TRANSFER_NO_DEVICE: {
-          msg = "Transfer device disconnected";
-        }
-        return;
+      case LIBUSB_TRANSFER_NO_DEVICE:
+        msg = "Transfer device disconnected";
+        // FIX Issue 5: Removed early return that skipped cleanup (memory leak)
         break;
       case LIBUSB_TRANSFER_OVERFLOW:
         msg = "Transfer overflow. Device sent more data than requested";
