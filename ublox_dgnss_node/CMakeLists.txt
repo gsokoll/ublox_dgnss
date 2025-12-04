@@ -15,6 +15,15 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Thread Sanitizer option for detecting data races (Issue 2 diagnostic)
+# Build with: colcon build --cmake-args -DENABLE_THREAD_SANITIZER=ON
+option(ENABLE_THREAD_SANITIZER "Enable Thread Sanitizer for race detection" OFF)
+if(ENABLE_THREAD_SANITIZER)
+  message(STATUS "Thread Sanitizer ENABLED - expect ~10x slowdown")
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+endif()
+
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 # find dependencies
