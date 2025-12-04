@@ -16,6 +16,7 @@
 #define UBLOX_DGNSS_NODE__UBX__UBX_CFG_HPP_
 
 #include <unistd.h>
+#include <iostream>
 #include <memory>
 #include <tuple>
 #include <vector>
@@ -71,13 +72,28 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
+    // FIX Issue 6: Guard against undersized payloads
+    // Minimum valid CFG-VALGET response is 4 bytes (version + layer + position)
+    if (size < 4) {
+      // DEMO: Log malformed payload observation
+      // Without this check, the loop condition would underflow and cause OOB access
+      std::cerr << "Issue 6 observation: CFG-VALGET payload too small (size=" 
+                << size << ", min=4). Without fix, this would cause underflow/OOB." 
+                << std::endl;
+      version = 0;
+      layer = 0;
+      position = 0;
+      return;  // Cannot parse, leave cfg_data empty
+    }
+
     version = payload_[0];
     layer = payload_[1];
     position = *reinterpret_cast<u2_t *>(&payload_[2]);
     size_t idx = 4;
-    // exttract key value data -
+    // extract key value data -
     // key will be 4 bytes + at least 1 byte for value
-    while (idx < static_cast<size_t>(size) - 4) {
+    // FIX Issue 6: Restructured condition to avoid underflow when size < 4
+    while (idx + 4 <= static_cast<size_t>(size)) {
       // create key and increment payload ptr index
       u4_t key_id = *reinterpret_cast<u4_t *>(&payload_[idx]);
       auto ubx_key_id = ubx_key_id_t {key_id};
@@ -87,6 +103,12 @@ public:
       unsigned char bytes[8];
       memset(&bytes, 0x00, sizeof(bytes));
       size_t value_size = ubx_key_id.storage_size();
+
+      // FIX Issue 6: Bounds check before reading value
+      if (idx + value_size > static_cast<size_t>(size)) {
+        break;  // Malformed payload, stop parsing
+      }
+
       memcpy(&bytes, &payload_[idx], value_size);
       idx += value_size;
 
