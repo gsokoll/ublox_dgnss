@@ -16,6 +16,7 @@
 #define UBLOX_DGNSS_NODE__UBX__MON__UBX_MON_VER_HPP_
 
 #include <unistd.h>
+#include <algorithm>
 #include <memory>
 #include <tuple>
 #include <string>
@@ -57,7 +58,10 @@ public:
     ptr += 10;
 
     while (ptr < (payload_.data() + size)) {
-      std::string s1(reinterpret_cast<char *>(ptr));
+      // FIX Issue 7: Use explicit length (30 bytes) to avoid OOB read if not null-terminated
+      size_t remaining = (payload_.data() + size) - ptr;
+      size_t ext_len = std::min(static_cast<size_t>(30), remaining);
+      std::string s1(reinterpret_cast<char *>(ptr), ext_len);
       extension.push_back(s1);
       ptr += 30;
     }

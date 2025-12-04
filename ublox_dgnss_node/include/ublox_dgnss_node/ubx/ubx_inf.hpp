@@ -46,7 +46,8 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
-    str = std::string(reinterpret_cast<char *>(payload_.data()));
+    // FIX Issue 7: Use explicit length to avoid OOB read if not null-terminated
+    str = std::string(reinterpret_cast<char *>(payload_.data()), size);
   }
   std::string to_string()
   {
@@ -79,7 +80,8 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
-    str = std::string(reinterpret_cast<char *>(payload_.data()));
+    // FIX Issue 7: Use explicit length to avoid OOB read if not null-terminated
+    str = std::string(reinterpret_cast<char *>(payload_.data()), size);
   }
 
   std::string to_string()
@@ -113,7 +115,8 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
-    str = std::string(reinterpret_cast<char *>(payload_.data()));
+    // FIX Issue 7: Use explicit length to avoid OOB read if not null-terminated
+    str = std::string(reinterpret_cast<char *>(payload_.data()), size);
   }
   std::string to_string()
   {
@@ -145,7 +148,8 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
-    str = std::string(reinterpret_cast<char *>(payload_.data()));
+    // FIX Issue 7: Use explicit length to avoid OOB read if not null-terminated
+    str = std::string(reinterpret_cast<char *>(payload_.data()), size);
   }
   std::string to_string()
   {
@@ -177,7 +181,8 @@ public:
     payload_.resize(size);
     memcpy(payload_.data(), payload_polled, size);
 
-    str = std::string(reinterpret_cast<char *>(payload_.data()));
+    // FIX Issue 7: Use explicit length to avoid OOB read if not null-terminated
+    str = std::string(reinterpret_cast<char *>(payload_.data()), size);
   }
   std::string to_string()
   {
