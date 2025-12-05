@@ -116,7 +116,11 @@ std::shared_ptr<FramePolled> get_polled_frame(
   std::shared_ptr<usb::Connection> usbc,
   std::shared_ptr<FramePoll> poll_frame)
 {
-  usbc->write_buffer(&poll_frame->buf[0], poll_frame->buf.size());
+  try {
+    usbc->write_buffer(&poll_frame->buf[0], poll_frame->buf.size());
+  } catch (usb::UsbException & e) {
+    throw e;  // Re-throw for caller to handle
+  }
 
   auto polled_frame = std::make_shared<FramePolled>();
 
