@@ -1454,8 +1454,17 @@ public:
         }
         RCLCPP_INFO(get_logger(), "nmea: %s", buf);
       } else {
-        // UBX starts with 0x65 0x62
-        if (len > 2 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
+        // UBX starts with 0xB5 0x62
+        // DEMO: Log truncated UBX frames that would have crashed before the fix (Issue 1)
+        // A valid UBX frame is minimum 8 bytes: sync(2) + class(1) + id(1) + length(2) + checksum(2)
+        if (len > 2 && len < 8 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Issue 1 observation: Truncated UBX frame rejected (len=%zu, min valid=8). "
+            "Without fix, this would cause OOB access in from_buf_build().", len);
+        }
+        // FIX Issue 1: Require minimum 8 bytes for valid UBX frame (was: len > 2)
+        if (len >= 8 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
           auto frame = std::make_shared<ubx::Frame>();
           frame->buf.reserve(len);
           frame->buf.resize(len);
@@ -1512,8 +1521,16 @@ public:
     size_t len = transfer_out->actual_length;
     unsigned char * buf = transfer_out->buffer;
 
-    // UBX starts with 0x65 0x62
-    if (len > 2 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
+    // UBX starts with 0xB5 0x62
+    // DEMO: Log truncated UBX frames that would have crashed before the fix (Issue 1)
+    if (len > 2 && len < 8 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Issue 1 observation (out): Truncated UBX frame rejected (len=%zu, min valid=8). "
+        "Without fix, this would cause OOB access in from_buf_build().", len);
+    }
+    // FIX Issue 1: Require minimum 8 bytes for valid UBX frame (was: len > 2)
+    if (len >= 8 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
       auto frame = std::make_shared<ubx::Frame>();
       frame->buf.resize(len);
       memcpy(frame->buf.data(), &buf[0], len);

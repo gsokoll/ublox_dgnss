@@ -60,3 +60,4 @@ imgui.ini
 *.py[co]
 
 CLAUDE.md
+private_reviews/
