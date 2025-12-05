@@ -1408,8 +1408,6 @@ public:
 
     rclcpp::Time ts = rclcpp::Clock().now();
 
-    const char * remove_any_of = "\n\r";
-
     size_t len = transfer_in->actual_length;
     unsigned char * buf = transfer_in->buffer;
 
@@ -1446,13 +1444,24 @@ public:
     if (len > 0) {
       // NMEA string starts with a $
       if (buf[0] == 0x24) {
-        buf[len] = 0;
-        for (size_t i = len - 2; i < len; i++) {
-          if (strchr(remove_any_of, buf[i])) {
-            buf[i] = 0;
-          }
+        // DEMO: Log when buffer is full (Issue 4 observation)
+        // Original code wrote buf[len]=0 which is OOB when len == buffer size
+        if (len >= transfer_in->length) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Issue 4 observation: NMEA buffer full (len=%zu, buf_size=%d). "
+            "Without fix, this would write 1 byte past buffer end.",
+            len, transfer_in->length);
         }
-        RCLCPP_INFO(get_logger(), "nmea: %s", buf);
+        // FIX Issue 4: Copy to local string instead of writing into libusb buffer
+        // This avoids OOB write when actual_length == buffer_length
+        std::string nmea_str(reinterpret_cast<char*>(buf), len);
+        // Strip trailing \r\n
+        while (!nmea_str.empty() && 
+               (nmea_str.back() == '\r' || nmea_str.back() == '\n')) {
+          nmea_str.pop_back();
+        }
+        RCLCPP_INFO(get_logger(), "nmea: %s", nmea_str.c_str());
       } else {
         // UBX starts with 0xB5 0x62
         // DEMO: Log truncated UBX frames that would have crashed before the fix (Issue 1)
