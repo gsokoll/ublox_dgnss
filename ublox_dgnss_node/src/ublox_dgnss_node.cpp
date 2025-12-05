@@ -610,6 +610,11 @@ private:
   bool param_fetch_in_progress_ = false;
   static constexpr auto PARAM_FETCH_TIMEOUT = std::chrono::seconds(5);
 
+  // Track pending VALGET batches for NAK handling (Issue 11)
+  // Each entry is a list of parameter names in that batch
+  std::deque<std::vector<std::string>> pending_valget_batches_;
+  std::mutex pending_valget_mutex_;
+
   std::string frame_id_;
   const std::string FRAME_ID_PARAM_NAME = "FRAME_ID";
 
@@ -2301,19 +2306,13 @@ private:
           get_logger(), "ubx class: 0x%02x id: 0x%02x ack nak payload - %s",
           f->ubx_frame->msg_class, f->ubx_frame->msg_id,
           payload_ack_nak->to_string().c_str());
-        // TODO(someday) investigate how to get a message about why it returned a nak
-        // switch (payload_ack_nak->msg_id) {
-        //   case ubx::UBX_CFG_VALSET:
-        //       if (ubx_cfg_->cfg_val_set_frame().use_count()>0) {
-        //         RCLCPP_WARN(get_logger(), "retrying last cfg val set ...");
-        //         ubx_cfg_->cfg_val_set_poll_retry_async();
-        //         // only retry once
-        //         ubx_cfg_->cfg_val_set_frame_reset();
-        //       }
-        //     break;
-        //   default:
-        //     break;
-        // }
+
+        // Issue 11 fix: Handle NAK for CFG-VALGET by clearing pending parameters
+        if (payload_ack_nak->msg_class == ubx::UBX_CFG &&
+          payload_ack_nak->msg_id == ubx::UBX_CFG_VALGET)
+        {
+          handle_valget_nak();
+        }
         break;
       default:
         RCLCPP_WARN(
@@ -2323,6 +2322,44 @@ private:
     }
   }
 
+  // Issue 11 fix: Handle NAK for CFG-VALGET requests
+  // When device NAKs a VALGET request (e.g., unsupported parameter),
+  // transition those parameters from PARAM_VALGET to PARAM_ACKNAK
+  // to prevent timeout waiting for responses that will never come.
+  UBLOX_DGNSS_NODE_LOCAL
+  void handle_valget_nak()
+  {
+    std::lock_guard<std::mutex> lock(pending_valget_mutex_);
+
+    if (pending_valget_batches_.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Issue 11: Received CFG-VALGET NAK but no pending batches tracked. "
+        "This may indicate out-of-order responses.");
+      return;
+    }
+
+    // Pop the oldest pending batch (FIFO order matches request/response order)
+    auto batch = pending_valget_batches_.front();
+    pending_valget_batches_.pop_front();
+
+    RCLCPP_WARN(
+      get_logger(),
+      "Issue 11: CFG-VALGET NAK received, clearing %zu parameters from pending state",
+      batch.size());
+
+    // Transition each parameter in the batch from PARAM_VALGET to PARAM_ACKNAK
+    for (const auto & param_name : batch) {
+      auto state = parameter_manager_->get_parameter_state(param_name);
+      if (state && state->param_status == PARAM_VALGET) {
+        parameter_manager_->update_parameter_status(param_name, PARAM_ACKNAK);
+        RCLCPP_DEBUG(
+          get_logger(),
+          "Issue 11: Parameter '%s' transitioned to PARAM_ACKNAK (device rejected)",
+          param_name.c_str());
+      }
+    }
+  }
 
   UBLOX_DGNSS_NODE_LOCAL
   void ubx_cfg_in_frame(ubx_queue_frame_t * f)
@@ -2335,6 +2372,14 @@ private:
           f->ubx_frame->msg_class, f->ubx_frame->msg_id,
           ubx_cfg_->cfg_val_get_payload()->to_string().c_str());
         ubx_cfg_payload_parameters(ubx_cfg_->cfg_val_get_payload());
+
+        // Issue 11: Clear pending batch on successful VALGET response
+        {
+          std::lock_guard<std::mutex> lock(pending_valget_mutex_);
+          if (!pending_valget_batches_.empty()) {
+            pending_valget_batches_.pop_front();
+          }
+        }
         break;
       default:
         RCLCPP_WARN(
@@ -3783,6 +3828,9 @@ private:
     size_t initial_params = 0;
     size_t n = 10;     // every n keys send a request
 
+    // Issue 11: Track current batch for NAK handling
+    std::vector<std::string> current_batch;
+
     parameter_manager_->iterate_config_items(
       [&](const ubx::cfg::ubx_cfg_item_t & ubx_ci) {
         auto p_state_maybe = parameter_manager_->get_parameter_state(ubx_ci.ubx_config_item);
@@ -3805,6 +3853,8 @@ private:
 
           item_list += ubx_ci.ubx_config_item;
           item_list += " ";
+          // Issue 11: Track parameter in current batch
+          current_batch.push_back(ubx_ci.ubx_config_item);
           initial_params++;
 
           // every n keys send a request
@@ -3814,8 +3864,19 @@ private:
                 get_logger(), "cfg_val_get_poll_async_all_layers ... %s",
                 item_list.c_str());
               item_list = "";
+
+              // Issue 11: Record pending batch BEFORE sending requests
+              // cfg_val_get_poll_async_all_layers sends 2 requests (default + RAM layer)
+              // so we add the batch twice to match expected responses/NAKs
+              {
+                std::lock_guard<std::mutex> lock(pending_valget_mutex_);
+                pending_valget_batches_.push_back(current_batch);  // For default layer
+                pending_valget_batches_.push_back(current_batch);  // For RAM layer
+              }
+
               ubx_cfg_->cfg_val_get_poll_async_all_layers();
               ubx_cfg_->cfg_val_get_keys_clear();
+              current_batch.clear();
             }
           }
         }
@@ -3824,6 +3885,14 @@ private:
     // send the final requests
     if (ubx_cfg_->cfg_val_get_keys_size() > 0) {
       RCLCPP_INFO(get_logger(), "cfg_val_get_poll_async_all_layers ... %s", item_list.c_str());
+
+      // Issue 11: Record pending batch for final request
+      {
+        std::lock_guard<std::mutex> lock(pending_valget_mutex_);
+        pending_valget_batches_.push_back(current_batch);  // For default layer
+        pending_valget_batches_.push_back(current_batch);  // For RAM layer
+      }
+
       ubx_cfg_->cfg_val_get_poll_async_all_layers();
       ubx_cfg_->cfg_val_get_keys_clear();
     }
@@ -3843,15 +3912,25 @@ private:
     size_t valget_count = parameter_manager_->count_parameters_by_status(PARAM_VALGET);
 
     if (valget_count == 0) {
-      // Success: All requested params received responses
+      // Success: All requested params received responses (or were NAK'd - Issue 11)
       param_fetch_in_progress_ = false;
       device_readiness_state_ = DeviceReadinessState::READY;
 
       size_t loaded_count = parameter_manager_->count_parameters_by_status(PARAM_LOADED);
-      RCLCPP_INFO(
-        get_logger(),
-        "Parameter fetch completed successfully - %zu parameters loaded from device",
-        loaded_count);
+      size_t acknak_count = parameter_manager_->count_parameters_by_status(PARAM_ACKNAK);
+
+      if (acknak_count > 0) {
+        // Issue 11: Some parameters were rejected by device
+        RCLCPP_WARN(
+          get_logger(),
+          "Parameter fetch completed - %zu loaded, %zu rejected by device (unsupported)",
+          loaded_count, acknak_count);
+      } else {
+        RCLCPP_INFO(
+          get_logger(),
+          "Parameter fetch completed successfully - %zu parameters loaded from device",
+          loaded_count);
+      }
 
       parameter_manager_->log_parameter_cache_state();
       return;
