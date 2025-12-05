@@ -1452,7 +1452,7 @@ public:
       if (buf[0] == 0x24) {
         // DEMO: Log when buffer is full (Issue 4 observation)
         // Original code wrote buf[len]=0 which is OOB when len == buffer size
-        if (len >= transfer_in->length) {
+        if (len >= static_cast<size_t>(transfer_in->length)) {
           RCLCPP_WARN(
             get_logger(),
             "Issue 4 observation: NMEA buffer full (len=%zu, buf_size=%d). "
