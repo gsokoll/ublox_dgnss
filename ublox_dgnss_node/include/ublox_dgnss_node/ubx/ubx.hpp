@@ -62,6 +62,22 @@ struct Frame
 
   void from_buf_build()
   {
+    // Defensive: never trust the wire. A well-formed UBX frame is at least
+    // 8 bytes (2 sync + class + id + 2 length + 2 checksum, zero payload).
+    // A buffer shorter than that cannot be indexed safely, so bail out with
+    // an empty/neutral frame instead of over-reading. Does not throw - this
+    // is reachable from the inbound libusb callback path.
+    if (buf.size() < 8) {
+      sync_char_1 = 0;
+      sync_char_2 = 0;
+      msg_class = 0;
+      msg_id = 0;
+      length = 0;
+      payload = nullptr;
+      ck_a = 0;
+      ck_b = 0;
+      return;
+    }
     sync_char_1 = buf[0];
     sync_char_2 = buf[1];
     msg_class = buf[2];
@@ -70,6 +86,20 @@ struct Frame
     payload = reinterpret_cast<ch_t *>(&buf[6]);
     ck_a = buf[buf.size() - 2];
     ck_b = buf[buf.size() - 1];
+  }
+
+  // Returns true when buf holds exactly one complete, self-consistent UBX
+  // frame: at least the 8-byte minimum and the declared length matches the
+  // number of bytes present (6 header+length bytes + payload + 2 checksum).
+  // Callers in the inbound path use this to reject malformed/short frames
+  // before trusting the parsed length/payload. Never throws.
+  bool is_valid_framing() const
+  {
+    if (buf.size() < 8) {
+      return false;
+    }
+    u2_t len = *reinterpret_cast<const u2_t *>(&buf[4]);
+    return static_cast<size_t>(6) + len + 2 == buf.size();
   }
 
   std::tuple<u1_t, u1_t> ubx_check_sum()
@@ -147,7 +177,7 @@ std::shared_ptr<FramePolled> get_polled_frame(
         // make sure checksums match
         u1_t ck_a, ck_b;
         std::tie(ck_a, ck_b) = polled_frame->ubx_check_sum();
-        if (ck_a != polled_frame->ck_a && ck_b != polled_frame->ck_b) {
+        if (ck_a != polled_frame->ck_a || ck_b != polled_frame->ck_b) {
           throw UbxAckNackException("polled frame checksum failed");
         }
 

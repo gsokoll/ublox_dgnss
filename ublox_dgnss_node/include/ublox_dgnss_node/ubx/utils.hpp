@@ -191,7 +191,7 @@ inline T swap_endian(T & value)
 }
 
 template<typename T>
-inline T buf_offset(std::vector<u1_t> * buf, u2_t offset)
+inline T buf_offset(std::vector<u1_t> * buf, size_t offset)
 {
   T value;
   memcpy(&value, buf->data() + offset, sizeof(T));

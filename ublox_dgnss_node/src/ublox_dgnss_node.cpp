@@ -669,6 +669,12 @@ private:
 // so put them in a queue, with a timestamp to be processed later
   std::deque<ubx_queue_frame_t> ubx_queue_;
   std::mutex ubx_queue_mutex_;
+  // Persistent UBX byte-stream accumulator. A single USB bulk transfer may
+  // carry several concatenated UBX messages, or a single message may span
+  // multiple transfers; bytes are appended here and complete frames are sliced
+  // out. Touched only from ublox_in_callback (the libusb in-transfer callback),
+  // so it needs no mutex.
+  std::vector<uint8_t> ubx_rx_accum_;
   std::deque<rtcm_queue_frame_t> rtcm_queue_;
   std::mutex rtcm_queue_mutex_;
 
@@ -1649,43 +1655,41 @@ public:
     }
     */
 
+    // This is a libusb transfer callback: a C++ exception must never propagate
+    // across the C callback boundary (undefined behaviour). All parsing below
+    // is bounds-checked and non-throwing; malformed/short/over-long frames are
+    // dropped defensively and we keep going.
+
+    // Maximum bytes we will buffer in the UBX accumulator before declaring the
+    // stream corrupt and resyncing. A valid UBX frame is 6 + length + 2 bytes
+    // with length capped at u2 (65535), so the largest possible single frame is
+    // 65543 bytes; this cap is strictly larger than that so a legitimate
+    // max-size frame is never mistaken for garbage, while still bounding memory
+    // against a wedged or garbage stream.
+    constexpr size_t kUbxAccumCap = 128 * 1024;
+
     if (len > 0) {
       // NMEA string starts with a $
       if (buf[0] == 0x24) {
-        buf[len] = 0;
-        for (size_t i = len - 2; i < len; i++) {
-          if (strchr(remove_any_of, buf[i])) {
-            buf[i] = 0;
-          }
+        // Do NOT write buf[len]: when actual_length == buffer capacity that
+        // indexes one byte past the libusb transfer buffer. Build a string
+        // from exactly the bytes received and trim trailing CR/LF instead.
+        std::string nmea(reinterpret_cast<char *>(buf), len);
+        while (!nmea.empty() && strchr(remove_any_of, nmea.back())) {
+          nmea.pop_back();
         }
-        RCLCPP_INFO(get_logger(), "nmea: %s", buf);
-      } else {
-        // UBX starts with 0x65 0x62
-        if (len > 2 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
-          auto frame = std::make_shared<ubx::Frame>();
-          frame->buf.reserve(len);
-          frame->buf.resize(len);
-          memcpy(frame->buf.data(), &buf[0], len);
-          frame->from_buf_build();
-          ubx_queue_frame_t queue_frame {ts, frame, FrameType::frame_in};
-          {
-            const std::lock_guard<std::mutex> lock(ubx_queue_mutex_);
-            ubx_queue_.push_back(queue_frame);
-          }
-
-          // RTCM3 messages start with a 0xD3 for preamble, followed by 0x00
-        } else {
-          if (len > 2 && buf[0] == 0xD3 && buf[1] == 0x00) {
-            std::vector<uint8_t> frame_buf;
-            frame_buf.reserve(len);
-            frame_buf.resize(len);
-            memcpy(frame_buf.data(), &buf[0], len);
-            rtcm_queue_frame_t queue_frame {ts, frame_buf, FrameType::frame_in};
-            {
-              const std::lock_guard<std::mutex> lock(rtcm_queue_mutex_);
-              rtcm_queue_.push_back(queue_frame);
-            }
-          }
+        RCLCPP_INFO(get_logger(), "nmea: %s", nmea.c_str());
+      } else if (buf[0] == 0xD3 && len > 2 && buf[1] == 0x00) {
+        // RTCM3 messages start with a 0xD3 preamble, followed by 0x00. RTCM is
+        // length-framed differently from UBX, so handle it as-is per transfer.
+        std::vector<uint8_t> frame_buf;
+        frame_buf.reserve(len);
+        frame_buf.resize(len);
+        memcpy(frame_buf.data(), &buf[0], len);
+        rtcm_queue_frame_t queue_frame {ts, frame_buf, FrameType::frame_in};
+        {
+          const std::lock_guard<std::mutex> lock(rtcm_queue_mutex_);
+          rtcm_queue_.push_back(queue_frame);
         }
 
         std::ostringstream os;
@@ -1693,8 +1697,78 @@ public:
         for (size_t i = 0; i < len; i++) {
           os << std::setfill('0') << std::setw(2) << std::right << std::hex << +buf[i];
         }
-
         RCLCPP_DEBUG(get_logger(), "in - buf: %s", os.str().c_str());
+      } else if ((buf[0] == ubx::UBX_SYNC_CHAR_1 &&
+        (len < 2 || buf[1] == ubx::UBX_SYNC_CHAR_2)) || !ubx_rx_accum_.empty())
+      {
+        // UBX path. A single bulk transfer can pack multiple UBX messages, and
+        // a single message can span transfers, so feed bytes through a
+        // persistent accumulator and slice out whole frames. We only enter this
+        // branch when the transfer starts with a UBX sync (0xB5 [0x62]) or the
+        // accumulator already holds a partial frame (continuation) - that keeps
+        // us from mixing transports, since a given transfer is one transport.
+        ubx_rx_accum_.insert(ubx_rx_accum_.end(), buf, buf + len);
+
+        size_t pos = 0;
+        while (true) {
+          // Find a sync pair at the front; discard any leading garbage up to
+          // the next 0xB5 0x62.
+          while (pos + 1 < ubx_rx_accum_.size() &&
+            !(ubx_rx_accum_[pos] == ubx::UBX_SYNC_CHAR_1 &&
+            ubx_rx_accum_[pos + 1] == ubx::UBX_SYNC_CHAR_2))
+          {
+            ++pos;
+          }
+          // Not enough bytes to even hold a sync pair: keep a possible trailing
+          // lone 0xB5 and wait for more.
+          if (pos + 1 >= ubx_rx_accum_.size()) {
+            break;
+          }
+          // Need at least 6 bytes (sync + class + id + 2-byte length) to read
+          // the little-endian payload length at offset 4.
+          if (pos + 6 > ubx_rx_accum_.size()) {
+            break;
+          }
+          uint16_t payload_len =
+            static_cast<uint16_t>(ubx_rx_accum_[pos + 4]) |
+            (static_cast<uint16_t>(ubx_rx_accum_[pos + 5]) << 8);
+          size_t frame_len = static_cast<size_t>(6) + payload_len + 2;
+          // A single frame can never exceed the cap; if it claims to, the
+          // length is garbage - resync by skipping this sync byte.
+          if (frame_len > kUbxAccumCap) {
+            ++pos;
+            continue;
+          }
+          // Full frame not yet present (spans transfers): wait for more data.
+          if (pos + frame_len > ubx_rx_accum_.size()) {
+            break;
+          }
+          // We have one complete frame.
+          auto frame = std::make_shared<ubx::Frame>();
+          frame->buf.resize(frame_len);
+          memcpy(frame->buf.data(), &ubx_rx_accum_[pos], frame_len);
+          frame->from_buf_build();
+          ubx_queue_frame_t queue_frame {ts, frame, FrameType::frame_in};
+          {
+            const std::lock_guard<std::mutex> lock(ubx_queue_mutex_);
+            ubx_queue_.push_back(queue_frame);
+          }
+          pos += frame_len;
+        }
+
+        // Drop consumed/garbage bytes from the front; keep the unparsed tail.
+        if (pos > 0) {
+          ubx_rx_accum_.erase(ubx_rx_accum_.begin(), ubx_rx_accum_.begin() + pos);
+        }
+        // Corrupt stream guard: if the accumulator grows without yielding a
+        // frame, clear it and resync.
+        if (ubx_rx_accum_.size() > kUbxAccumCap) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "ubx accumulator exceeded %zu bytes without a frame; clearing",
+            kUbxAccumCap);
+          ubx_rx_accum_.clear();
+        }
       }
     } else {
       RCLCPP_DEBUG(get_logger(), "in - buf len is zero");

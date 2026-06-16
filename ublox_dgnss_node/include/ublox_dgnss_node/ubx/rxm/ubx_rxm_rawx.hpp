@@ -107,8 +107,18 @@ public:
     version = buf_offset<u1_t>(&payload_, 13);
 
     meas_data.clear();
+    // Defensive: the 16-byte header is followed by num_meas * 32-byte blocks.
+    // A device/stream that under-delivers payload would otherwise drive
+    // buf_offset past the end of payload_. Clamp the loop to whatever the
+    // payload can actually hold so we never read out of bounds. Reachable
+    // from the inbound frame path, so clamp rather than throw.
+    u1_t safe_num_meas = num_meas;
+    if (payload_.size() < static_cast<size_t>(16) + static_cast<size_t>(32) * num_meas) {
+      safe_num_meas = (payload_.size() >= 16) ?
+        static_cast<u1_t>((payload_.size() - 16) / 32) : 0;
+    }
     size_t offset = 16;
-    for (u1_t i = 0; i < num_meas; ++i) {
+    for (u1_t i = 0; i < safe_num_meas; ++i) {
       meas_data_t meas;
       meas.pr_mes = buf_offset<r8_t>(&payload_, offset);
       meas.cp_mes = buf_offset<r8_t>(&payload_, offset + 8);

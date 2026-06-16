@@ -64,8 +64,17 @@ public:
     version = buf_offset<u1_t>(&payload_, 6);
 
     dwrd.clear();
+    // Defensive: the 8-byte header is followed by num_words * 4-byte words.
+    // Clamp to what the payload can actually hold so buf_offset never reads
+    // past payload_. Reachable from the inbound frame path, so clamp rather
+    // than throw.
+    u1_t safe_num_words = num_words;
+    if (payload_.size() < static_cast<size_t>(8) + static_cast<size_t>(4) * num_words) {
+      safe_num_words = (payload_.size() >= 8) ?
+        static_cast<u1_t>((payload_.size() - 8) / 4) : 0;
+    }
     size_t offset = 8;
-    for (u1_t i = 0; i < num_words; ++i) {
+    for (u1_t i = 0; i < safe_num_words; ++i) {
       dwrd.push_back(buf_offset<u4_t>(&payload_, offset));
       offset += 4;
     }
