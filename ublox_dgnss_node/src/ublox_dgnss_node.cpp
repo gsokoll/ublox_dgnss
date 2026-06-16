@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <chrono>
 #include <ctime>
@@ -357,6 +358,13 @@ public:
     usb_init_timer_ = create_wall_timer(
       10ms, std::bind(&UbloxDGNSSNode::handle_usb_init_callback, this));
 
+    // Deferred-reconnect timer: runs the heavy re-init off the libusb event
+    // thread (cluster F). On the param-processing callback group (mutually
+    // exclusive with handle_param_processing_callback) so re-init can't race it.
+    reconnect_timer_ = create_wall_timer(
+      100ms, std::bind(&UbloxDGNSSNode::handle_reconnect_callback, this),
+      callback_group_param_processing_timer_);
+
     RCLCPP_DEBUG(get_logger(), "creating ubx_timer_ ...");
     ubx_queue_.clear();
     ubx_timer_ = create_wall_timer(
@@ -473,8 +481,9 @@ public:
     RCLCPP_INFO(this->get_logger(), "finished");
   }
 
+  // Returns true only if the device was opened AND async init completed.
   UBLOX_DGNSS_NODE_LOCAL
-  void perform_usb_initialization(bool from_timer = false)
+  bool perform_usb_initialization(bool from_timer = false)
   {
     if (from_timer) {
       RCLCPP_INFO(get_logger(), "Starting USB initialization");
@@ -489,7 +498,7 @@ public:
       // Check device readiness
       if (!usbc_->devh_valid()) {
         RCLCPP_DEBUG(get_logger(), "Device not ready for init_async");
-        return;
+        return false;
       }
 
       // USB async init
@@ -508,6 +517,7 @@ public:
         usb_init_timer_->cancel();
         RCLCPP_DEBUG(get_logger(), "USB initialization complete - timer disabled");
       }
+      return true;
     } catch (std::string const & msg) {
       RCLCPP_ERROR(this->get_logger(), "usb init error: %s", msg.c_str());
       if (usbc_ != nullptr) {
@@ -537,6 +547,7 @@ public:
       }
       rclcpp::shutdown();
     }
+    return false;
   }
 
   UBLOX_DGNSS_NODE_LOCAL
@@ -630,8 +641,10 @@ private:
   }
 
 private:
-  bool keep_running_ = true;
-  bool device_attached_ = false;
+  // Written on the libusb event thread (hotplug callbacks) and read on the
+  // subscription / timer threads -> atomic (cluster F).
+  std::atomic<bool> keep_running_{true};
+  std::atomic<bool> device_attached_{false};
   bool is_initialising_;
   enum class DeviceReadinessState
   {
@@ -639,7 +652,11 @@ private:
     READY       // Device operational
   };
   DeviceReadinessState device_readiness_state_ = DeviceReadinessState::UNREADY;
-  bool has_been_connected_before_ = false;  // Track if this is reconnection
+  std::atomic<bool> has_been_connected_before_{false};  // Track if this is reconnection
+  // Set (event thread) by hotplug_attach_callback on a reconnection; the heavy,
+  // blocking perform_usb_initialization() is then run OFF the event thread by
+  // handle_reconnect_callback so it never stalls the libusb event pump (NODE-03).
+  std::atomic<bool> reconnect_pending_{false};
 
   rclcpp::CallbackGroup::SharedPtr callback_group_usb_events_timer_;
   rclcpp::CallbackGroup::SharedPtr callback_group_ubx_timer_;
@@ -685,6 +702,8 @@ private:
 
 // once the usb is initialised this timer is disabled
   rclcpp::TimerBase::SharedPtr usb_init_timer_;
+// polls reconnect_pending_ and runs the deferred re-init off the event thread
+  rclcpp::TimerBase::SharedPtr reconnect_timer_;
 
   std::shared_ptr<ParameterManager> parameter_manager_;
 
@@ -1830,6 +1849,9 @@ public:
     RCLCPP_DEBUG(this->get_logger(), "usb connection: %s", msg.c_str());
   }
 
+  // NOTE: invoked on the libusb event thread (libusb dispatches the hotplug
+  // callback from inside handle_usb_events). Must stay cheap and non-blocking -
+  // the heavy re-init is deferred to handle_reconnect_callback (cluster F).
   UBLOX_DGNSS_NODE_PUBLIC
   void hotplug_attach_callback()
   {
@@ -1838,21 +1860,40 @@ public:
     bool is_reconnection = has_been_connected_before_;
 
     if (is_reconnection) {
-      // Reconnection: Just restore user parameters
+      // Reconnection: schedule the blocking re-init OFF this (event) thread so we
+      // don't stall the libusb event pump. READY is only set once that re-init
+      // actually succeeds (see handle_reconnect_callback) - NODE-06.
       RCLCPP_INFO(
         get_logger(),
-        "Device reconnected - restoring user parameters and refreshing device state");
-      // USB async init
-
-      perform_usb_initialization();  // Existing full init
-
-      device_readiness_state_ = DeviceReadinessState::READY;
-      RCLCPP_INFO(get_logger(), "Hotplug device re-connection completed");
+        "Device reconnected - scheduling re-initialization off the event thread");
+      reconnect_pending_ = true;
     } else {
       // Initial connection: Full initialization
       device_readiness_state_ = DeviceReadinessState::READY;
       has_been_connected_before_ = true;
       RCLCPP_INFO(get_logger(), "Initial device connection completed");
+    }
+  }
+
+  // Runs on the param-processing callback group (NOT the event thread). Performs
+  // the deferred reconnection re-init and only marks the device READY if it
+  // actually succeeded.
+  UBLOX_DGNSS_NODE_LOCAL
+  void handle_reconnect_callback()
+  {
+    if (!reconnect_pending_.exchange(false)) {
+      return;
+    }
+    RCLCPP_INFO(get_logger(), "Performing deferred device re-initialization");
+    bool ok = perform_usb_initialization();
+    if (ok) {
+      device_readiness_state_ = DeviceReadinessState::READY;
+      RCLCPP_INFO(get_logger(), "Hotplug device re-connection completed");
+    } else {
+      device_readiness_state_ = DeviceReadinessState::UNREADY;
+      RCLCPP_WARN(
+        get_logger(),
+        "Deferred re-initialization did not complete - device not marked ready");
     }
   }
 
