@@ -123,6 +123,13 @@ public:
       [this]() {
         RCLCPP_INFO(this->get_logger(), "Initiating shutdown ...");
         this->keep_running_ = false;
+        // Cluster D: stop the event pump and wait for any in-flight cycle to
+        // finish (usb_events_mutex_) BEFORE tearing down USB transfers, so the
+        // event thread can't reap/free a transfer that shutdown() is freeing.
+        const std::lock_guard<std::mutex> lock(usb_events_mutex_);
+        if (handle_usb_events_timer_) {
+          handle_usb_events_timer_->cancel();
+        }
         if (usbc_ != nullptr) {
           usbc_->shutdown();
         }
@@ -451,9 +458,17 @@ public:
   ~UbloxDGNSSNode()
   {
     keep_running_ = false;
-    if (usbc_) {
-      usbc_->shutdown();
-      usbc_.reset();
+    // Cluster D: same ordered teardown as on_shutdown. usb_events_mutex_ ensures
+    // no event-pump cycle is freeing transfers while we shut down / free usbc_.
+    {
+      const std::lock_guard<std::mutex> lock(usb_events_mutex_);
+      if (handle_usb_events_timer_) {
+        handle_usb_events_timer_->cancel();
+      }
+      if (usbc_) {
+        usbc_->shutdown();
+        usbc_.reset();
+      }
     }
     RCLCPP_INFO(this->get_logger(), "finished");
   }
@@ -643,6 +658,12 @@ private:
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameters_callback_handle_;
 // specific to libusb to to process events asynchronously
   rclcpp::TimerBase::SharedPtr handle_usb_events_timer_;
+  // Serializes the libusb event pump (handle_usb_events_callback) against the
+  // shutdown path (on_shutdown lambda / destructor calling usbc_->shutdown()).
+  // Without it the 10ms timer can reap/free transfers on the event thread while
+  // shutdown cancels+frees the same transfers -> heap corruption
+  // (malloc_consolidate / unaligned fastbin, SIGABRT). Cluster D.
+  std::mutex usb_events_mutex_;
 
 // don't want to block fetching of messages from the ublox device,
 // so put them in a queue, with a timestamp to be processed later
@@ -1254,6 +1275,10 @@ public:
   UBLOX_DGNSS_NODE_LOCAL
   void handle_usb_events_callback()
   {
+    // Hold usb_events_mutex_ for the whole pump cycle so shutdown() cannot run
+    // concurrently with reaping/freeing transfers on this thread (cluster D).
+    const std::lock_guard<std::mutex> lock(usb_events_mutex_);
+
     if (!keep_running_) {
       RCLCPP_WARN(get_logger(), "shutting down handling of usb events ...");
       handle_usb_events_timer_->cancel();
