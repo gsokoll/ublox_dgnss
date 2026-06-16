@@ -26,6 +26,9 @@
 #include <functional>
 #include <deque>
 #include <mutex>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <vector>
 #include <memory>
 
@@ -141,19 +144,46 @@ private:
   connection_exception_cb_fn exception_cb_fn_;
   connection_debug_cb_fn debug_cb_fn_;
   struct timeval timeout_tv_;
-  bool keep_running_;
-  bool attached_;
+  // Flags read on the subscription/writer threads and written on the libusb
+  // event-timer thread (and hotplug callbacks): made atomic so reads are never
+  // torn/stale and to give a release/acquire fence around the state changes.
+  std::atomic<bool> keep_running_;
+  std::atomic<bool> attached_;
 
-  USBDriverState driver_state_;
+  std::atomic<USBDriverState> driver_state_;
 
   size_t err_count_ = 0;
 
   std::deque<std::shared_ptr<transfer_t>> transfer_queue_;
   std::mutex transfer_queue_mutex_;
+  // write_mutex_ serializes all use of devh_ for I/O *submission*
+  // (write_char/write_buffer/write_buffer_async) AND the teardown of devh_ in
+  // close_devh(). Holding it during close prevents a writer on the subscription
+  // thread from dereferencing a handle that the event thread is closing
+  // (use-after-free / null-deref). Lock ordering is always
+  // write_mutex_ -> transfer_queue_mutex_ (never the reverse) to avoid deadlock.
   std::mutex write_mutex_;
 
   int no_device_streak_ = 0;
   static constexpr int kNoDeviceThreshold = 3;
+
+  // Finite timeout (ms) on async IN transfers so a device that stops delivering
+  // data while still enumerated produces periodic LIBUSB_TRANSFER_TIMED_OUT
+  // callbacks (observability) instead of a pending transfer that never returns.
+  unsigned int in_timeout_ms_ = 2000;
+  // Consecutive stalled/timed-out IN transfers before escalating to recovery.
+  // ~kStallThreshold * in_timeout_ms_ of no data => attempt reset (e.g. 4*2s=8s).
+  static constexpr int kStallThreshold = 4;
+
+  // --- stall / wedge detection (cluster C) ---
+  // Updated on every successfully completed IN transfer (event thread) and read
+  // by the watchdog. Lets the driver notice a device that has stopped delivering
+  // data while still enumerated (no NO_DEVICE / hotplug), which is the multi-hour
+  // LIBUSB_ERROR_TIMEOUT wedge. Steady-clock nanoseconds since epoch; 0 = never.
+  std::atomic<int64_t> last_in_completed_ns_{0};
+  // Consecutive non-COMPLETED IN transfer statuses (stall/timeout/error) seen in
+  // callback_in; reset to 0 on a completed IN transfer. Event-thread only.
+  int in_stall_streak_ = 0;
 
 private:
   libusb_device_handle * open_device_with_serial_string(
@@ -181,6 +211,21 @@ private:
   void cleanup_transfer_queue();
   void cleanup_all_transfers();
   void close_devh();
+
+  // --- cluster C: stall / wedge recovery ---
+  // Attempt an in-place recovery of a wedged-but-still-enumerated device:
+  // clear_halt on the data endpoints, then libusb_reset_device. Holds
+  // write_mutex_ so no writer dereferences devh_ mid-reset. Returns true if the
+  // handle is still usable afterwards (caller resubmits IN transfers); false if
+  // the device needs full re-enumeration (caller flips attached_=false so the
+  // node reconnection path reopens it). Validated out-of-band: a standalone
+  // libusb_reset_device() recovered the wedged F9R instantly with no replug.
+  bool recover_device();
+  // Record that an IN transfer completed (event thread): updates the watchdog
+  // timestamp and clears the stall streak.
+  void note_in_completed();
+  // steady_clock nanoseconds since epoch (helper for the watchdog timestamp)
+  static int64_t steady_now_ns();
 
 public:
   void init();  // throws exception on failure

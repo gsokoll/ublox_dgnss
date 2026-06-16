@@ -532,6 +532,11 @@ void Connection::write_char(u_char c)
   int rc = 0;
   {
     const std::lock_guard<std::mutex> lock(write_mutex_);
+    // Re-check the handle under the lock: close_devh() also holds write_mutex_
+    // while it nulls/closes devh_, so this can't dereference a freed handle.
+    if (devh_ == nullptr) {
+      throw UsbException("write_char: device handle closed");
+    }
     rc = libusb_bulk_transfer(
       devh_,
       ep_data_out_addr_ | LIBUSB_ENDPOINT_OUT,
@@ -561,6 +566,15 @@ void Connection::write_buffer(u_char * buf, size_t size)
   int rc = 0;
   {
     const std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Re-check the handle under the lock (see write_char): the lock-free
+    // dev_valid()/attached() pre-check in the caller (rtcm_callback) is not
+    // enough — a hotplug detach on the event thread can close devh_ between that
+    // check and here. close_devh() holds write_mutex_, so the handle is stable
+    // for the duration of this transfer.
+    if (devh_ == nullptr) {
+      throw UsbException("write_buffer: device handle closed");
+    }
 
     rc = libusb_bulk_transfer(
       devh_,
@@ -657,6 +671,7 @@ void Connection::callback_in(struct libusb_transfer * transfer)
   if (transfer->status == libusb_transfer_status::LIBUSB_TRANSFER_COMPLETED) {
     (in_cb_fn_)(transfer);
     err_count_ = 0;
+    note_in_completed();  // cluster C: feed the stall watchdog
   } else {
     std::string msg;
     switch (transfer->status) {
@@ -701,6 +716,28 @@ void Connection::callback_in(struct libusb_transfer * transfer)
   (*sp)->completed = true;
   delete sp;  // cleanup
 
+  // cluster C: wedge detection / recovery. Now that IN transfers carry a finite
+  // timeout, a device that stops delivering data while still enumerated produces
+  // repeated TIMED_OUT (or STALL/ERROR) here with no NO_DEVICE/hotplug event.
+  // After kStallThreshold consecutive non-progress statuses, attempt an in-place
+  // clear_halt + reset (validated to recover the wedged F9R); if that cannot
+  // recover the handle, flag ERROR/detached so the node reconnection path reopens.
+  if (transfer->status != LIBUSB_TRANSFER_COMPLETED &&
+    transfer->status != LIBUSB_TRANSFER_NO_DEVICE &&
+    transfer->status != LIBUSB_TRANSFER_CANCELLED)
+  {
+    if (++in_stall_streak_ >= kStallThreshold && attached_) {
+      if (debug_cb_fn_) {
+        (debug_cb_fn_)("callback_in: IN-transfer stall streak reached threshold - recovering device");
+      }
+      if (!recover_device()) {
+        driver_state_ = USBDriverState::ERROR;
+        attached_ = false;
+      }
+      in_stall_streak_ = 0;
+    }
+  }
+
   // only queue another transfer in if none outstanding and attached
   // (debug_cb_fn_)("callback_in: queue_count=" + std::to_string(queued_transfer_in_num()));
   if (attached_ && queued_transfer_in_num() == 0) {
@@ -724,6 +761,13 @@ void Connection::write_buffer_async(u_char * buf, size_t size, void * user_data)
     throw UsbException("No exception callback function set");
   }
 
+  // Hold write_mutex_ across make_transfer_out (reads devh_) and submit: this
+  // serializes the async OUT submission against close_devh() so devh_ cannot be
+  // closed mid-fill/submit. Lock ordering stays write_mutex_ -> transfer_queue_mutex_.
+  const std::lock_guard<std::mutex> lock(write_mutex_);
+  if (devh_ == nullptr || !attached_) {
+    throw UsbException("write_buffer_async: device handle closed");
+  }
   auto transfer_out = make_transfer_out(buf, size);
   submit_transfer(transfer_out, "async submit transfer out: ");
 }
@@ -761,11 +805,15 @@ std::shared_ptr<transfer_t> Connection::make_transfer_in()
   transfer->usb_transfer->user_data = new std::shared_ptr<transfer_t>(transfer);
 
   // setup asynchronous transfer in to host from usb
+  // Finite timeout (in_timeout_ms_) instead of 0/infinite so a stalled device
+  // surfaces as a periodic LIBUSB_TRANSFER_TIMED_OUT that the watchdog in
+  // callback_in can act on (cluster C). With data flowing normally the transfer
+  // completes well before the timeout, so this does not affect throughput.
   libusb_fill_bulk_transfer(
     transfer->usb_transfer, devh_, ep_data_in_addr_ | LIBUSB_ENDPOINT_IN,
     // in_buffer_, IN_BUFFER_SIZE,
     transfer->buffer->data(), transfer->buffer->size(),
-    callback_in_fn_, transfer->usb_transfer->user_data, 0);
+    callback_in_fn_, transfer->usb_transfer->user_data, in_timeout_ms_);
 
   return transfer;
 }
@@ -968,8 +1016,63 @@ void Connection::handle_usb_events()
   }
 }
 
+int64_t Connection::steady_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Connection::note_in_completed()
+{
+  last_in_completed_ns_.store(steady_now_ns(), std::memory_order_relaxed);
+  in_stall_streak_ = 0;
+}
+
+bool Connection::recover_device()
+{
+  // Hold write_mutex_ so no writer dereferences devh_ while we clear_halt/reset.
+  const std::lock_guard<std::mutex> lock(write_mutex_);
+  if (devh_ == nullptr) {return false;}
+
+  if (debug_cb_fn_) {
+    (debug_cb_fn_)("recover_device: clear_halt + reset on wedged-but-enumerated device");
+  }
+
+  // A simple endpoint halt clear is often enough for a STALL and is cheap.
+  libusb_clear_halt(devh_, ep_data_in_addr_ | LIBUSB_ENDPOINT_IN);
+  libusb_clear_halt(devh_, ep_data_out_addr_ | LIBUSB_ENDPOINT_OUT);
+
+  // Full device reset. Proven out-of-band to recover the wedged F9R instantly
+  // (libusb_reset_device / pyusb dev.reset()) with no physical replug.
+  int rc = libusb_reset_device(devh_);
+  if (rc == 0) {
+    last_in_completed_ns_.store(steady_now_ns(), std::memory_order_relaxed);
+    in_stall_streak_ = 0;
+    if (debug_cb_fn_) {
+      (debug_cb_fn_)("recover_device: libusb_reset_device succeeded - resuming");
+    }
+    return true;
+  }
+
+  // LIBUSB_ERROR_NOT_FOUND => the device re-enumerated and this handle is dead;
+  // the caller flips attached_=false so the node reconnection/hotplug path reopens.
+  if (debug_cb_fn_) {
+    (debug_cb_fn_)(std::string("recover_device: reset failed (") +
+      libusb_error_name(rc) + ") - handing off to reconnect");
+  }
+  return false;
+}
+
 void Connection::close_devh()
 {
+  // Serialize the handle teardown against writers (write_buffer/_char/_async on
+  // the subscription thread): take write_mutex_ BEFORE closing so no writer is
+  // mid-libusb_bulk_transfer on devh_ when we free it (use-after-free / null
+  // deref). Acquiring write_mutex_ first (then transfer_queue_mutex_ inside the
+  // cleanup helpers) keeps the global lock order write_mutex_ -> transfer_queue_mutex_,
+  // so this can never deadlock against a writer that submits under write_mutex_.
+  const std::lock_guard<std::mutex> lock(write_mutex_);
+
   // Clean up all pending transfers before closing device
   cleanup_transfer_queue();  // completed
   cleanup_all_transfers();  // any remaining

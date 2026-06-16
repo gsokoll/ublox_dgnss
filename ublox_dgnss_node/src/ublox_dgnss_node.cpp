@@ -1566,8 +1566,16 @@ public:
 
     RCLCPP_DEBUG(get_logger(), "rtcm_callback msg.message: 0x%s", oss.str().c_str());
 
+    // Use the asynchronous OUT path so this subscription-executor callback never
+    // blocks (the synchronous write_buffer holds write_mutex_ for up to 250ms,
+    // stalling other callbacks in this group when the device is wedged). The
+    // dev_valid()/attached() checks above are a cheap early-out + one-shot log;
+    // the authoritative guard is inside write_buffer_async, which re-validates
+    // devh_ under write_mutex_, so a hotplug detach racing this call can no longer
+    // cause a use-after-free. write_buffer_async copies the buffer, so data_out
+    // may safely go out of scope.
     try {
-      usbc_->write_buffer(data_out.data(), data_out.size());
+      usbc_->write_buffer_async(data_out.data(), data_out.size(), nullptr);
     } catch (const usb::UsbException & e) {
       RCLCPP_WARN(get_logger(), "RTCM write failed: %s", e.what());
     }
