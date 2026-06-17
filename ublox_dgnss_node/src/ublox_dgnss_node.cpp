@@ -23,6 +23,7 @@
 #include <optional>
 #include <vector>
 #include <map>
+#include <utility>
 #include <algorithm>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -696,6 +697,25 @@ private:
   std::mutex rtcm_queue_mutex_;
 
   std::mutex cfg_batch_mutex_;
+
+  // PARAM-01: keys (name + key id) included in the most-recently sent
+  // CFG-VALSET batch. Recorded under cfg_batch_mutex_ on the request path and
+  // read on the response (ubx_timer) ACK/NAK path so that a CFG-VALSET NAK can
+  // be diagnosed by key name and the offending key(s) isolated. A single batch
+  // is sent and acked before the next is assembled, so one slot is sufficient.
+  std::vector<std::pair<std::string, ubx::cfg::ubx_key_id_t>> cfg_valset_inflight_keys_;
+  // FIFO of parameter names for single-key isolation re-sends. The device's
+  // ACK/NAK does not echo which key it rejected, so isolation re-sends are
+  // matched to their ACK/NAK by send order: front() is the oldest outstanding
+  // single-key VALSET. A NAK against the front entry names the unsupported key.
+  // Touched only on the ubx_timer (response) thread under cfg_batch_mutex_.
+  std::deque<std::string> cfg_valset_isolation_pending_;
+
+  // PARAM-03: how many param-fetch poll cycles have elapsed; after a bounded
+  // number of cycles still-PARAM_VALGET keys are demoted to absent and the
+  // fetch proceeds to READY rather than waiting on a blanket timeout.
+  size_t param_fetch_poll_cycles_ = 0;
+  static constexpr size_t kParamFetchMaxPollCycles = 3;
 
   rclcpp::TimerBase::SharedPtr ubx_timer_;
   rclcpp::TimerBase::SharedPtr rtcm_timer_;
@@ -1947,6 +1967,10 @@ public:
       std::string item_list;
       size_t i = 0;
       size_t n = 10;  // every n output a request
+
+      // PARAM-01: record every key sent in this batch so a CFG-VALSET NAK can be
+      // diagnosed by name and the offending key(s) isolated on the response path.
+      cfg_valset_inflight_keys_.clear();
       for (const std::string & param_name : param_names) {
         const ubx::cfg::ubx_cfg_item_t * cfg_item =
           parameter_manager_->find_config_item(param_name);
@@ -1987,6 +2011,7 @@ public:
 
         ubx_cfg_->cfg_val_set_key_append(cfg_item->ubx_key_id, value);
         any_params_added = true;
+        cfg_valset_inflight_keys_.emplace_back(param_name, cfg_item->ubx_key_id);
         item_list += param_name;
         item_list += " ";
 
@@ -2029,6 +2054,81 @@ public:
       RCLCPP_ERROR(get_logger(), "Exception in batch send: %s", e.what());
       ubx_cfg_->cfg_val_set_cfgdata_clear();
       return false;
+    }
+  }
+
+  // PARAM-01 (isolation fallback): a CFG-VALSET that contains an unsupported key
+  // is rejected *as a whole* with a single ACK-NAK, so NONE of the keys in the
+  // batch are applied. To recover, re-send every key from the failing batch as
+  // its OWN single-key transactionless CFG-VALSET. Valid keys then ACK and take
+  // effect; an unsupported key NAKs its own single-key VALSET.
+  //
+  // The device's ACK/NAK does not echo which config key it rejected, so the
+  // re-sent key names are pushed onto cfg_valset_isolation_pending_ in send
+  // order; the ACK/NAK handler pops the front entry for each CFG-VALSET response
+  // and reports the offender by name when that response is a NAK. This is the
+  // simpler, hardware-safe fallback to full recursive bisection (which would
+  // need richer request/response correlation that cannot be validated without a
+  // device).
+  //
+  // Runs on the ubx_timer (response) thread from the ACK/NAK handler, called
+  // WITHOUT cfg_batch_mutex_ held; it takes the lock itself in the same order as
+  // every request path, so no new lock cycle is introduced. It does NOT recurse
+  // (a NAK against an isolation re-send is reported, never re-isolated).
+  UBLOX_DGNSS_NODE_LOCAL
+  void resend_valset_keys_individually(
+    const std::vector<std::pair<std::string, ubx::cfg::ubx_key_id_t>> & keys)
+  {
+    if (keys.empty()) {
+      return;
+    }
+    if (usbc_->driver_state() != usb::USBDriverState::CONNECTED || ubx_cfg_ == nullptr ||
+      !parameter_manager_)
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Cannot isolate CFG-VALSET NAK - device/config not available");
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(cfg_batch_mutex_);
+
+    for (const auto & kv : keys) {
+      const std::string & param_name = kv.first;
+      ubx::cfg::ubx_key_id_t key_id = kv.second;  // copy: to_hex() is non-const
+
+      const ubx::cfg::ubx_cfg_item_t * cfg_item =
+        parameter_manager_->find_config_item(param_name);
+      if (!cfg_item) {
+        continue;
+      }
+      auto param_state_maybe = parameter_manager_->get_parameter_state(param_name);
+      if (!param_state_maybe || !param_state_maybe.value().param_value) {
+        continue;
+      }
+      rclcpp::Parameter param(param_name, param_state_maybe.value().param_value.value());
+      ubx::value_t value;
+      if (!convert_ros_param_to_ubx_value(param, *cfg_item, value)) {
+        continue;
+      }
+
+      try {
+        ubx_cfg_->cfg_val_set_cfgdata_clear();
+        ubx_cfg_->cfg_val_set_layer_ram(true);
+        ubx_cfg_->cfg_val_set_transaction(0);  // Transactionless single key
+        ubx_cfg_->cfg_val_set_key_append(cfg_item->ubx_key_id, value);
+        ubx_cfg_->cfg_val_set_poll_async();
+        ubx_cfg_->cfg_val_set_cfgdata_clear();
+        // Track this re-send so its ACK/NAK can be matched in send order.
+        cfg_valset_isolation_pending_.push_back(param_name);
+        RCLCPP_DEBUG(
+          get_logger(), "CFG-VALSET isolation: re-sent single key %s (%s)",
+          param_name.c_str(), key_id.to_hex().c_str());
+      } catch (const std::exception & e) {
+        RCLCPP_WARN(
+          get_logger(), "CFG-VALSET isolation: failed to re-send %s: %s",
+          param_name.c_str(), e.what());
+      }
     }
   }
 
@@ -2636,6 +2736,20 @@ private:
           get_logger(), "ubx class: 0x%02x id: 0x%02x ack ack payload - %s",
           f->ubx_frame->msg_class, f->ubx_frame->msg_id,
           payload_ack_ack->to_string().c_str());
+        // PARAM-01: if this ACK belongs to an outstanding single-key isolation
+        // re-send, consume the matching FIFO entry (key applied successfully).
+        if (payload_ack_ack->msg_class == ubx::UBX_CFG &&
+          payload_ack_ack->msg_id == ubx::UBX_CFG_VALSET)
+        {
+          std::lock_guard<std::mutex> lock(cfg_batch_mutex_);
+          if (!cfg_valset_isolation_pending_.empty()) {
+            std::string applied = cfg_valset_isolation_pending_.front();
+            cfg_valset_isolation_pending_.pop_front();
+            RCLCPP_INFO(
+              get_logger(),
+              "CFG-VALSET isolation: key %s accepted and applied", applied.c_str());
+          }
+        }
         break;
       case ubx::UBX_ACK_NAK:
         payload_ack_nak = std::make_shared<ubx::ack::AckNakPayload>(
@@ -2645,19 +2759,15 @@ private:
           get_logger(), "ubx class: 0x%02x id: 0x%02x ack nak payload - %s",
           f->ubx_frame->msg_class, f->ubx_frame->msg_id,
           payload_ack_nak->to_string().c_str());
-        // TODO(someday) investigate how to get a message about why it returned a nak
-        // switch (payload_ack_nak->msg_id) {
-        //   case ubx::UBX_CFG_VALSET:
-        //       if (ubx_cfg_->cfg_val_set_frame().use_count()>0) {
-        //         RCLCPP_WARN(get_logger(), "retrying last cfg val set ...");
-        //         ubx_cfg_->cfg_val_set_poll_retry_async();
-        //         // only retry once
-        //         ubx_cfg_->cfg_val_set_frame_reset();
-        //       }
-        //     break;
-        //   default:
-        //     break;
-        // }
+        // PARAM-01: the NAK payload carries the class/id of the rejected message
+        // (here CFG-VALSET) but NOT which key failed - the device rejects the
+        // whole VALSET and applies none of its keys. Turn that silent failure
+        // into a diagnosable one and recover the good keys.
+        if (payload_ack_nak->msg_class == ubx::UBX_CFG &&
+          payload_ack_nak->msg_id == ubx::UBX_CFG_VALSET)
+        {
+          handle_cfg_valset_nak();
+        }
         break;
       default:
         RCLCPP_WARN(
@@ -2667,18 +2777,89 @@ private:
     }
   }
 
+  // PARAM-01: handle a CFG-VALSET ACK-NAK on the ubx_timer (response) thread.
+  // Two cases, distinguished by the isolation FIFO:
+  //   1. cfg_valset_isolation_pending_ non-empty -> this NAK is the response to
+  //      a single-key isolation re-send: pop the matching key and name it as the
+  //      unsupported/rejected key. Do NOT re-isolate (no recursion).
+  //   2. FIFO empty -> a whole batch was rejected (none of its keys applied).
+  //      Log the full batch key list at WARN (minimum diagnosability) and then
+  //      re-send each key individually so the valid keys are still applied and
+  //      the offender is isolated by name on its own single-key NAK.
+  UBLOX_DGNSS_NODE_LOCAL
+  void handle_cfg_valset_nak()
+  {
+    std::vector<std::pair<std::string, ubx::cfg::ubx_key_id_t>> batch_to_isolate;
+    {
+      std::lock_guard<std::mutex> lock(cfg_batch_mutex_);
+      if (!cfg_valset_isolation_pending_.empty()) {
+        std::string offender = cfg_valset_isolation_pending_.front();
+        cfg_valset_isolation_pending_.pop_front();
+        RCLCPP_WARN(
+          get_logger(),
+          "CFG-VALSET rejected (NAK) for key %s - parameter unsupported on this "
+          "device and was NOT applied", offender.c_str());
+        return;
+      }
+      // Batch-level NAK: capture the in-flight batch keys for isolation.
+      batch_to_isolate = cfg_valset_inflight_keys_;
+    }
+
+    if (batch_to_isolate.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "CFG-VALSET NAK received but no in-flight batch keys recorded - "
+        "cannot identify which keys were rejected");
+      return;
+    }
+
+    std::string names;
+    for (const auto & kv : batch_to_isolate) {
+      ubx::cfg::ubx_key_id_t key_id = kv.second;  // to_hex() is non-const
+      names += kv.first;
+      names += "(";
+      names += key_id.to_hex();
+      names += ") ";
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "CFG-VALSET batch NAK - the device rejected the whole batch and applied "
+      "NONE of these %zu keys: %s", batch_to_isolate.size(), names.c_str());
+    RCLCPP_WARN(
+      get_logger(),
+      "Re-sending each key individually to apply the supported ones and "
+      "isolate the offending key(s) by name");
+
+    resend_valset_keys_individually(batch_to_isolate);
+  }
+
 
   UBLOX_DGNSS_NODE_LOCAL
   void ubx_cfg_in_frame(ubx_queue_frame_t * f)
   {
     switch (f->ubx_frame->msg_id) {
       case ubx::UBX_CFG_VALGET:
-        ubx_cfg_->set_cfg_val_get_frame(f->ubx_frame);
-        RCLCPP_DEBUG(
-          get_logger(), "ubx class: 0x%02x id: 0x%02x cfg polled payload - %s",
-          f->ubx_frame->msg_class, f->ubx_frame->msg_id,
-          ubx_cfg_->cfg_val_get_payload()->to_string().c_str());
-        ubx_cfg_payload_parameters(ubx_cfg_->cfg_val_get_payload());
+        {
+          // PARAM-02: UbxCfg's VALGET frame/payload state (cfg_valget_) is shared
+          // mutable state with no internal locking. The request-assembly paths
+          // mutate cfg_valget_ under cfg_batch_mutex_; this response path
+          // (ubx_timer thread) writes cfg_valget_ via set_cfg_val_get_frame() and
+          // then reads it via cfg_val_get_payload()/ubx_cfg_payload_parameters().
+          // Take cfg_batch_mutex_ here so the two threads do not race on
+          // cfg_valget_. Lock order is consistent everywhere
+          // (cfg_batch_mutex_ -> ParameterManager::param_cache_mutex_); the
+          // request paths never block waiting on the ubx_timer thread while
+          // holding cfg_batch_mutex_ (their USB writes are async/non-blocking),
+          // so no deadlock cycle is introduced. The ubx_timer callback group is
+          // MutuallyExclusive, so this path is not re-entered from itself.
+          std::lock_guard<std::mutex> lock(cfg_batch_mutex_);
+          ubx_cfg_->set_cfg_val_get_frame(f->ubx_frame);
+          RCLCPP_DEBUG(
+            get_logger(), "ubx class: 0x%02x id: 0x%02x cfg polled payload - %s",
+            f->ubx_frame->msg_class, f->ubx_frame->msg_id,
+            ubx_cfg_->cfg_val_get_payload()->to_string().c_str());
+          ubx_cfg_payload_parameters(ubx_cfg_->cfg_val_get_payload());
+        }
         break;
       default:
         RCLCPP_WARN(
@@ -4121,6 +4302,7 @@ private:
 
     param_fetch_start_time_ = std::chrono::steady_clock::now();
     param_fetch_in_progress_ = true;
+    param_fetch_poll_cycles_ = 0;     // PARAM-03(b): reset bounded-cycle counter
 
     ubx_cfg_->cfg_val_get_keys_clear();
     ubx_cfg_->cfg_set_val_get_layer_default();
@@ -4128,6 +4310,41 @@ private:
     std::string item_list;
     size_t initial_params = 0;
     size_t n = 10;     // every n keys send a request
+
+    // PARAM-03(a): collect the keys queued into the current request chunk and
+    // mark them PARAM_VALGET only AFTER the async poll write actually succeeded.
+    // Previously keys were marked PARAM_VALGET as they were appended, i.e.
+    // before the write - so a failed write would leave a key stuck in
+    // PARAM_VALGET forever (no response can ever arrive). A key that is never
+    // written stays PARAM_INITIAL and can be retried on the next fetch cycle.
+    std::vector<std::string> chunk_pending;
+
+    // Helper: send the currently queued chunk and, only on a successful write,
+    // promote its keys to PARAM_VALGET. Returns true if a write was issued.
+    auto flush_chunk = [&]() -> bool {
+        if (ubx_cfg_->cfg_val_get_keys_size() == 0) {
+          chunk_pending.clear();
+          return false;
+        }
+        try {
+          ubx_cfg_->cfg_val_get_poll_async_all_layers();
+          ubx_cfg_->cfg_val_get_keys_clear();
+          // Write succeeded - now mark the keys as requested.
+          for (const auto & name : chunk_pending) {
+            parameter_manager_->update_parameter_status(name, PARAM_VALGET);
+          }
+          chunk_pending.clear();
+          return true;
+        } catch (const std::exception & e) {
+          RCLCPP_WARN(
+            get_logger(),
+            "CFG-VALGET poll write failed (%s) - leaving %zu keys PARAM_INITIAL "
+            "for retry", e.what(), chunk_pending.size());
+          ubx_cfg_->cfg_val_get_keys_clear();
+          chunk_pending.clear();
+          return false;
+        }
+      };
 
     parameter_manager_->iterate_config_items(
       [&](const ubx::cfg::ubx_cfg_item_t & ubx_ci) {
@@ -4143,11 +4360,9 @@ private:
             get_logger(), "cfg_val_get param %zu: %s", initial_params,
             ubx_ci.ubx_config_item);
 
-          // Add key to CFG-VALGET request
+          // Add key to CFG-VALGET request and remember it for post-write marking.
           ubx_cfg_->cfg_val_get_key_append(ubx_ci.ubx_key_id);
-
-          // Mark as PARAM_VALGET (request sent)
-          parameter_manager_->update_parameter_status(ubx_ci.ubx_config_item, PARAM_VALGET);
+          chunk_pending.push_back(ubx_ci.ubx_config_item);
 
           item_list += ubx_ci.ubx_config_item;
           item_list += " ";
@@ -4155,14 +4370,11 @@ private:
 
           // every n keys send a request
           if (initial_params % n == 0) {
-            if (ubx_cfg_->cfg_val_get_keys_size() > 0) {
-              RCLCPP_INFO(
-                get_logger(), "cfg_val_get_poll_async_all_layers ... %s",
-                item_list.c_str());
-              item_list = "";
-              ubx_cfg_->cfg_val_get_poll_async_all_layers();
-              ubx_cfg_->cfg_val_get_keys_clear();
-            }
+            RCLCPP_INFO(
+              get_logger(), "cfg_val_get_poll_async_all_layers ... %s",
+              item_list.c_str());
+            item_list = "";
+            flush_chunk();
           }
         }
       });
@@ -4170,8 +4382,7 @@ private:
     // send the final requests
     if (ubx_cfg_->cfg_val_get_keys_size() > 0) {
       RCLCPP_INFO(get_logger(), "cfg_val_get_poll_async_all_layers ... %s", item_list.c_str());
-      ubx_cfg_->cfg_val_get_poll_async_all_layers();
-      ubx_cfg_->cfg_val_get_keys_clear();
+      flush_chunk();
     }
 
     RCLCPP_INFO(
@@ -4199,6 +4410,37 @@ private:
         "Parameter fetch completed successfully - %zu parameters loaded from device",
         loaded_count);
 
+      parameter_manager_->log_parameter_cache_state();
+      return;
+    }
+
+    // PARAM-03(b): the device omits unsupported/unset keys from the CFG-VALGET
+    // response entirely, so those keys never leave PARAM_VALGET and valget_count
+    // would otherwise only reach 0 by accident. After a bounded number of poll
+    // cycles with keys still outstanding, treat the remaining keys as
+    // absent/unsupported (PARAM_ACKNAK - "poll for value did not work"), which
+    // takes them out of PARAM_VALGET so the fetch can complete promptly instead
+    // of waiting on the blanket timeout. The success path for supported keys is
+    // unchanged - they leave PARAM_VALGET as their responses arrive.
+    if (++param_fetch_poll_cycles_ >= kParamFetchMaxPollCycles) {
+      auto absent_params = parameter_manager_->get_parameters_by_status(PARAM_VALGET);
+      RCLCPP_WARN(
+        get_logger(),
+        "Parameter fetch: %zu key(s) returned no CFG-VALGET response after %zu poll "
+        "cycles - marking as absent/unsupported and proceeding:",
+        absent_params.size(), param_fetch_poll_cycles_);
+      for (const auto & param : absent_params) {
+        RCLCPP_WARN(get_logger(), "  Absent on device: %s", param.c_str());
+        parameter_manager_->update_parameter_status(param, PARAM_ACKNAK);
+      }
+
+      param_fetch_in_progress_ = false;
+      device_readiness_state_ = DeviceReadinessState::READY;
+      size_t loaded_count = parameter_manager_->count_parameters_by_status(PARAM_LOADED);
+      RCLCPP_INFO(
+        get_logger(),
+        "Parameter fetch completed - %zu parameters loaded from device, "
+        "%zu absent/unsupported", loaded_count, absent_params.size());
       parameter_manager_->log_parameter_cache_state();
       return;
     }
