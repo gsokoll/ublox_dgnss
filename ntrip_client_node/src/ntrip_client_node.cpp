@@ -112,6 +112,17 @@ public:
         handle, CURLOPT_PRIVATE,
         reinterpret_cast<void *>(desiredCount));
 
+      // Progress callback so a blocked curl_easy_perform() aborts promptly when
+      // streaming_exit_ is set (clean shutdown / join()).
+      curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+      curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, &NTRIPClientNode::XferInfoCallback);
+      curl_easy_setopt(handle, CURLOPT_XFERINFODATA, this);
+
+      // Defence in depth: a silent/stalled caster (no data, connection kept open) also
+      // unblocks because curl progress callbacks may not fire without I/O activity.
+      curl_easy_setopt(handle, CURLOPT_LOW_SPEED_LIMIT, 1L);
+      curl_easy_setopt(handle, CURLOPT_LOW_SPEED_TIME, 10L);
+
       // Dynamic options extracted to ApplyCurlOptions() for runtime reconfiguration
       ApplyCurlOptions();
 
@@ -292,6 +303,22 @@ private:
     return size * nmemb;
   }
 
+  // Progress/transfer callback used to abort an in-flight curl_easy_perform() when
+  // streaming_exit_ is set. Without this, curl_easy_perform() blocks indefinitely while
+  // the caster keeps the connection open and the destructor's join() would hang forever.
+  // Returning non-zero causes curl_easy_perform() to return CURLE_ABORTED_BY_CALLBACK.
+  static int XferInfoCallback(
+    void * clientp,
+    curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+    curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
+  {
+    auto * node = static_cast<NTRIPClientNode *>(clientp);
+    if (node->streaming_exit_.load()) {
+      return 1;  // abort transfer -> CURLE_ABORTED_BY_CALLBACK
+    }
+    return 0;
+  }
+
   // DoStreaming with runtime parameter reconfiguration support
   void DoStreaming()
   {
@@ -326,6 +353,12 @@ private:
 
         // Skip stale res handling — immediately perform with new config
         continue;
+      }
+
+      // Aborted by our xferinfo callback because shutdown was requested — not an error.
+      // The while condition will now re-evaluate and exit the loop.
+      if (res == CURLE_ABORTED_BY_CALLBACK && streaming_exit_.load()) {
+        break;
       }
 
       // Check for any errors
